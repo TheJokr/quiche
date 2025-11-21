@@ -25,10 +25,7 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use quiche::ConnectionId;
-use std::io::Write;
-use std::io::{
-    self,
-};
+use std::io;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 
@@ -57,44 +54,38 @@ impl AddrValidationTokenManager {
         &self, original_dcid: &[u8], client_addr: SocketAddr,
     ) -> Vec<u8> {
         let ip_bytes = match client_addr.ip() {
-            IpAddr::V4(addr) => addr.octets().to_vec(),
-            IpAddr::V6(addr) => addr.octets().to_vec(),
+            IpAddr::V4(addr) => &addr.octets()[..],
+            IpAddr::V6(addr) => &addr.octets()[..],
         };
 
         let token_len = HMAC_TAG_LEN + ip_bytes.len() + original_dcid.len();
-        let mut token = io::Cursor::new(vec![0u8; token_len]);
+        let mut token = Vec::with_capacity(token_len);
 
-        token.set_position(HMAC_TAG_LEN as u64);
-        token.write_all(&ip_bytes).unwrap();
-        token.write_all(original_dcid).unwrap();
+        token.extend_from_slice(ip_bytes);
+        token.extend_from_slice(original_dcid);
 
-        let tag = boring::hash::hmac_sha256(
-            &self.sign_key,
-            &token.get_ref()[HMAC_TAG_LEN..],
-        )
-        .unwrap();
+        let tag = boring::hash::hmac_sha256(&self.sign_key, &token).unwrap();
+        debug_assert_eq!(tag.len(), HMAC_TAG_LEN);
 
-        token.set_position(0);
-        token.write_all(tag.as_ref()).unwrap();
+        token.extend_from_slice(&tag);
 
-        token.into_inner()
+        token
     }
 
     pub(super) fn validate_and_extract_original_dcid<'t>(
         &self, token: &'t [u8], client_addr: SocketAddr,
     ) -> io::Result<ConnectionId<'t>> {
         let ip_bytes = match client_addr.ip() {
-            IpAddr::V4(addr) => addr.octets().to_vec(),
-            IpAddr::V6(addr) => addr.octets().to_vec(),
+            IpAddr::V4(addr) => &addr.octets()[..],
+            IpAddr::V6(addr) => &addr.octets()[..],
         };
 
-        let hmac_and_ip_len = HMAC_TAG_LEN + ip_bytes.len();
-
-        if token.len() < hmac_and_ip_len {
+        let Some((payload, tag)) = split_last_n(token, HMAC_TAG_LEN) else {
+            return Err("token is too short").into_io();
+        };
+        if payload.len() < ip_bytes.len() {
             return Err("token is too short").into_io();
         }
-
-        let (tag, payload) = token.split_at(HMAC_TAG_LEN);
 
         let expected_tag =
             boring::hash::hmac_sha256(&self.sign_key, payload).unwrap();
@@ -103,12 +94,18 @@ impl AddrValidationTokenManager {
             return Err("signature verification failed").into_io();
         }
 
-        if payload[..ip_bytes.len()] != *ip_bytes {
+        let (recvd_ip, original_dcid) = payload.split_at(ip_bytes.len());
+        if recvd_ip != ip_bytes {
             return Err("IPs don't match").into_io();
         }
 
-        Ok(ConnectionId::from_ref(&token[hmac_and_ip_len..]))
+        Ok(ConnectionId::from_ref(original_dcid))
     }
+}
+
+fn split_last_n(v: &[u8], n: usize) -> Option<(&[u8], &[u8])> {
+    let mid = v.len().checked_sub(n)?;
+    v.split_at_checked(mid)
 }
 
 #[cfg(test)]
@@ -118,29 +115,24 @@ mod tests {
     #[test]
     fn generate() {
         let manager = AddrValidationTokenManager::default();
+        let v4_addr = "127.0.0.1:1337".parse().unwrap();
+        let v6_addr = "[::1]:1338".parse().unwrap();
 
-        let assert_tag_generated = |token: &[u8]| {
-            let tag = &token[..HMAC_TAG_LEN];
-            let all_nulls = tag.iter().all(|b| *b == 0u8);
+        let token = manager.gen(b"foo", v4_addr);
 
-            assert!(!all_nulls);
-        };
+        let (payload, tag) = split_last_n(&token, HMAC_TAG_LEN).unwrap();
+        assert!(!tag.iter().all(|b| *b == 0));
+        assert_eq!(payload[..4], [127, 0, 0, 1]);
+        assert_eq!(&payload[4..], b"foo");
 
-        let token = manager.gen(b"foo", "127.0.0.1:1337".parse().unwrap());
+        let token = manager.gen(b"bar", v6_addr);
 
-        assert_tag_generated(&token);
-        assert_eq!(token[HMAC_TAG_LEN..HMAC_TAG_LEN + 4], [127, 0, 0, 1]);
-        assert_eq!(&token[HMAC_TAG_LEN + 4..], b"foo");
-
-        let token = manager.gen(b"bar", "[::1]:1338".parse().unwrap());
-
-        assert_tag_generated(&token);
-
-        assert_eq!(token[HMAC_TAG_LEN..HMAC_TAG_LEN + 16], [
+        let (payload, tag) = split_last_n(&token, HMAC_TAG_LEN).unwrap();
+        assert!(!tag.iter().all(|b| *b == 0));
+        assert_eq!(payload[..16], [
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
         ]);
-
-        assert_eq!(&token[HMAC_TAG_LEN + 16..], b"bar");
+        assert_eq!(&payload[16..], b"bar");
     }
 
     #[test]
@@ -169,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_err_short_token() {
+    fn validate_err_token_wrong_size() {
         let manager = AddrValidationTokenManager::default();
         let v4_addr = "127.0.0.1:1337".parse().unwrap();
         let v6_addr = "[::1]:1338".parse().unwrap();
@@ -183,11 +175,10 @@ mod tests {
                 .validate_and_extract_original_dcid(&[1u8; HMAC_TAG_LEN], *addr)
                 .is_err());
 
+            let mut token = manager.gen(b"foo", *addr);
+            token.extend_from_slice(&[1; 17]);
             assert!(manager
-                .validate_and_extract_original_dcid(
-                    &[1u8; HMAC_TAG_LEN + 1],
-                    *addr
-                )
+                .validate_and_extract_original_dcid(&token, *addr)
                 .is_err());
         }
     }
